@@ -1,0 +1,157 @@
+version: 2.1
+description: Make a SSH tunnel, rsync data and finally symlink to virtualhost
+display:
+  home_url: https://www.ebowe.com/
+  source_url: https://github.com/ebowe/deployer
+
+orbs:
+  dmz: eddiewebb/dmz@volatile
+
+executors:
+  default:
+    docker:
+      - image: 'cimg/base:stable'
+
+commands:
+  deploy:
+    description: "SSH tunnel + RSYNC + SYMLINK"
+    parameters:
+      bastion_host:
+        description: The hostname or IP of your jump host in exposed DMZ
+        type: string
+      bastion_public_key:
+        default: ""
+        description: 'The public key of the bastion host to ensure mutual trust.  Argument
+          may be a value, ENV VAR name, or file path. If left empty `ssh keyscan <bastion_host>`
+          will trust it dynamically. '
+        type: string
+      bastion_user:
+        description: The username on your jump host in exposed DMZ that matches SSH
+          keys provided
+        type: string
+      local_port:
+        default: "9022"
+        description: The port to expose locally, most likely matches your target port
+        type: string
+      target_host:
+        description: The hostname or IP of your target service on private network
+        type: string
+      target_port:
+        default: "22"
+        description: The port of your target service on private network
+        type: string
+      target_user:
+        description: The user user to connect to the target host
+        type: string
+      remote_site_path:
+        description: The path of the remote site
+        type: string
+      remote_releases_folder:
+        default: "releases"
+        description: The path of the remote site
+        type: string
+      remote_release_folder:
+        description: The folder inside "remote_releases_folder" where files will be sync. $CIRCLE_SHA1 it's recommended.
+        type: string
+      remote_root_folder:
+        default: "current"
+        description: The path of the remote site
+        type: string
+      remote_keep_versions:
+        default: 2
+        description: The amount of version to keep
+        type: integer
+      folder_to_sync:
+        default: "~/project/"
+        description: The folder inside the working dir to by sync
+        type: string
+      remote_pre_activate_hook_scripts:
+        default: ""
+        description: Script to run in the remote server before activating the deployment
+        type: string
+      remote_post_activate_hook_scripts:
+        default: ""
+        description: Script to run in the remote server after activating the deployment
+        type: string
+    steps:
+      - run: sudo apt-get update
+      - run: sudo apt-get install -y rsync
+      - dmz/open_tunnel:
+          bastion_host: <<parameters.bastion_host>>
+          bastion_public_key: <<parameters.bastion_public_key>>
+          bastion_user: <<parameters.bastion_user>>
+          local_port: <<parameters.local_port>>
+          target_host: <<parameters.target_host>>
+          target_port: <<parameters.target_port>>
+      - run:
+          name: Make temp dir
+          command: |
+            echo "Make temp dir: \
+              <<parameters.target_port>>/<<parameters.remote_releases_folder>>/<<parameters.remote_release_folder>>-$CIRCLE_BUILD_NUM"
+            ssh -o StrictHostKeyChecking=no <<parameters.target_user>>@localhost -p <<parameters.local_port>> \
+              "mkdir -p <<parameters.remote_site_path>>/<<parameters.remote_releases_folder>>/<<parameters.remote_release_folder>>-$CIRCLE_BUILD_NUM"
+      - run:
+          name: Deploy Over SSH
+          command: |
+            echo "Copy from: <<parameters.folder_to_sync>> to: \
+              <<parameters.remote_site_path>>/<<parameters.remote_releases_folder>>/<<parameters.remote_release_folder>>-$CIRCLE_BUILD_NUM"
+            rsync -avz -e "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p <<parameters.local_port>>" \
+              --progress <<parameters.folder_to_sync>> <<parameters.target_user>>@localhost:<<parameters.remote_site_path>>/<<parameters.remote_releases_folder>>/<<parameters.remote_release_folder>>-$CIRCLE_BUILD_NUM
+      - when:
+          condition: << parameters.remote_pre_activate_hook_scripts >>
+          steps:
+            - run:
+                name: Pre hook scripts
+                command: |
+                  ssh -o StrictHostKeyChecking=no <<parameters.target_user>>@localhost -p <<parameters.local_port>> \
+                          "<< parameters.remote_pre_activate_hook_scripts >>"
+      - run:
+          name: Update symlink
+          command: |
+            echo "Make symlink: \
+              <<parameters.remote_site_path>>/<<parameters.remote_releases_folder>>/<<parameters.remote_release_folder>>-$CIRCLE_BUILD_NUM \
+              <<parameters.remote_site_path>>/<<parameters.remote_root_folder>>"
+            ssh -o StrictHostKeyChecking=no <<parameters.target_user>>@localhost -p <<parameters.local_port>> \
+              "ln -snf <<parameters.remote_site_path>>/<<parameters.remote_releases_folder>>/<<parameters.remote_release_folder>>-$CIRCLE_BUILD_NUM \
+              <<parameters.remote_site_path>>/<<parameters.remote_root_folder>>"
+      - when:
+          condition: << parameters.remote_post_activate_hook_scripts >>
+          steps:
+            - run:
+                name: Post hook scripts
+                command: |
+                  ssh -o StrictHostKeyChecking=no <<parameters.target_user>>@localhost -p <<parameters.local_port>> \
+                          "<< parameters.remote_post_activate_hook_scripts >>"
+      - run:
+          name: Remove old releases
+          command: |
+            echo "Remove old versions: \
+              <<parameters.remote_site_path>>/<<parameters.remote_releases_folder>>/<<parameters.remote_release_folder>>-$CIRCLE_BUILD_NUM \
+              <<parameters.remote_site_path>>/<<parameters.remote_root_folder>>"
+            ssh -o StrictHostKeyChecking=no <<parameters.target_user>>@localhost -p <<parameters.local_port>> \
+              "ls -C1 -t -d <<parameters.remote_site_path>>/<<parameters.remote_releases_folder>>/* | awk 'NR><<parameters.remote_keep_versions>>' | xargs -L1 rm -rf"
+
+examples:
+  envoyer_style:
+    description: Build, rsync, symlink and clean.
+    usage:
+      jobs:
+        build:
+          docker:
+            - image: circleci/node:10
+          steps:
+            - checkout
+            - run: npm build
+            - deployer/deploy:
+                bastion_host: jump-host.domain
+                bastion_user: ubuntu
+                local_port: "9022"
+                target_host: target-host.domain
+                target_port: "22"
+                target_user: "ubuntu"
+                remote_site_path: "/var/www/example.com"
+                remote_release_folder: $CIRCLE_SHA1
+                folder_to_sync: "~/project/dist/*"
+      orbs:
+        deployer: ebowe/deployer
+      version: 2.1
